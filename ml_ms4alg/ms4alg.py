@@ -4,10 +4,6 @@ from mountainlab_pytools import mdaio
 import sys
 import os
 import multiprocessing
-import dask
-import dask.multiprocessing
-
-
 import datetime
 
 # import h5py
@@ -67,13 +63,11 @@ def get_channel_neighborhood(m,Geom,*,adjacency_radius):
     inds=np.sort(inds)
     return inds.ravel()
 
-def subsample_array(X,max_num,seed=0):
+def subsample_array(X,max_num):
     if X.size==0:
         return X
     if max_num>=len(X):
         return X
-    if seed is not None:
-        np.random.seed(seed)
     inds=np.random.choice(len(X), max_num, replace=False)
     return X[inds]
 
@@ -135,23 +129,22 @@ def remove_zero_features(X):
     features_to_use=np.where(maxvals>0)[0]
     return X[features_to_use,:]
 
-def cluster(features,*,npca,seed=0):
+def cluster(features,*,npca,isocut_threshold):
     num_events_for_pca=np.minimum(features.shape[1],1000)
-    if seed is not None:
-        np.random.seed(seed)
     subsample_inds=np.random.choice(features.shape[1], num_events_for_pca, replace=False)
     u,s,vt=np.linalg.svd(features[:,subsample_inds])
     features2=(u.transpose())[0:npca,:]@features
     features2=remove_zero_features(features2)
-    labels=isosplit5.isosplit5(features2)
+    iso_opts = {'isocut_threshold':isocut_threshold} # added by sk 20'/12/2
+    labels=isosplit5.isosplit5(features2,isocut_threshold=isocut_threshold) # modified by sk 20'/12/2
     return labels
 
-def branch_cluster(features,*,branch_depth=2,npca=10):
+def branch_cluster(features,*,branch_depth=2,npca=10,isocut_threshold=1):
     if features.size == 0:
         return np.array([])
 
     min_size_to_try_split=20
-    labels1=cluster(features,npca=npca).ravel().astype('int64')
+    labels1=cluster(features,npca=npca,isocut_threshold=isocut_threshold).ravel().astype('int64')
     if np.min(labels1)<0:
         tmp_fname='/tmp/isosplit5-debug-features.mda'
         mdaio.writemda32(features,tmp_fname)
@@ -164,7 +157,7 @@ def branch_cluster(features,*,branch_depth=2,npca=10):
     for k in range(1,K+1):
         inds_k=np.where(labels1==k)[0]
         if len(inds_k)>min_size_to_try_split:
-            labels_k=branch_cluster(features[:,inds_k],branch_depth=branch_depth-1,npca=npca)
+            labels_k=branch_cluster(features[:,inds_k],branch_depth=branch_depth-1,npca=npca,isocut_threshold=isocut_threshold)
             K_k=int(np.max(labels_k))
             labels_new[inds_k]=label_offset+labels_k
             label_offset+=K_k
@@ -366,6 +359,7 @@ class _NeighborhoodSorter:
         detect_sign=o['detect_sign']
         detect_threshold=o['detect_threshold']
         num_features=o['num_features']
+        isocut_threshold = o['isocut_threshold']
         # num_features=10
         geom=self._geom
         if geom is None:
@@ -380,25 +374,23 @@ class _NeighborhoodSorter:
         
         ## TODO: remove this
         #X_neigh=X.getChunk(t1=0,t2=N,channels=nbhd_channels)
-        if self._sorting_opts['verbose']:
-            print('Neighboorhood of channel {} has {} channels.'.format(m_central,M_neigh))
+
+        print('Neighboorhood of channel {} has {} channels.'.format(m_central,M_neigh))
 
         if mode=='phase1':
-            if self._sorting_opts['verbose']:
-                print ('Detecting events on channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
+            print ('Detecting events on channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
             timer = datetime.datetime.now() 
             times,assign_to_this_neighborhood=detect_on_neighborhood_from_timeseries_model(X,channel=m_central,nbhd_channels=nbhd_channels,detect_threshold=detect_threshold,detect_sign=detect_sign,detect_interval=detect_interval,margin=clip_size,chunk_infos=chunk_infos)
-            if self._sorting_opts['verbose']:
-                print('Elapsed time for detect on neighborhood:',datetime.datetime.now()-timer)
-                print ('Num events detected on channel {} ({}): {}'.format(m_central+1,mode,len(times))); sys.stdout.flush()
+            print('Elapsed time for detect on neighborhood:',datetime.datetime.now()-timer)
+            print ('Num events detected on channel {} ({}): {}'.format(m_central+1,mode,len(times))); sys.stdout.flush()
         else:
             list=[]
             with h5py.File(self._hdf5_path,"r") as f:
                 for ii in range(self._num_assigned_event_time_arrays):
                     list.append(np.array(f.get('assigned-event-times-{}'.format(ii))))
             times=np.concatenate(list) if list else np.array([])
-        if self._sorting_opts['verbose']:
-            print ('Computing PCA features for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
+
+        print ('Computing PCA features for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
         # max_num_clips_for_pca=1000
         max_num_clips_for_pca=o['max_num_clips_for_pca']
         # Note: we use twice as many features, because of branch method (MT x F)
@@ -406,32 +398,26 @@ class _NeighborhoodSorter:
         ## It is possible that a small number of events are duplicates (not exactly sure why)
         ## Let's eliminate those
         if len(times)!=len(np.unique(times)):
-            if self._sorting_opts['verbose']:
-                print('WARNING: found {} of {} duplicate events for channel {} in {}'.format(len(times)-len(np.unique(times)),len(times),self._central_channel+1,mode))
+            print('WARNING: found {} of {} duplicate events for channel {} in {}'.format(len(times)-len(np.unique(times)),len(times),self._central_channel+1,mode))
             times=np.unique(times)
         else:
             if mode=='phase2':
-                if self._sorting_opts['verbose']:
-                    print('No duplicate events found for channel {} in {}'.format(self._central_channel,mode))
+                print('No duplicate events found for channel {} in {}'.format(self._central_channel,mode))
         #times=np.sort(times)
         features = compute_event_features_from_timeseries_model(X,times,nbhd_channels=nbhd_channels,clip_size=clip_size,max_num_clips_for_pca=max_num_clips_for_pca,num_features=num_features*2,chunk_infos=chunk_infos)
         
         # The clustering
-        if self._sorting_opts['verbose']:
-            print ('Clustering for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
-        labels=branch_cluster(features,branch_depth=2,npca=num_features)
+        print ('Clustering for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
+        labels=branch_cluster(features,branch_depth=2,npca=num_features,isocut_threshold=isocut_threshold)
         K=np.max(labels) if labels.size > 0 else 0
-        if self._sorting_opts['verbose']:
-            print ('Found {} clusters for channel {} ({})...'.format(K,m_central+1,mode)); sys.stdout.flush()
+        print ('Found {} clusters for channel {} ({})...'.format(K,m_central+1,mode)); sys.stdout.flush()
         
         if mode=='phase1':
-            if self._sorting_opts['verbose']:
-                print ('Computing templates for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
+            print ('Computing templates for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
             templates=compute_templates_from_timeseries_model(X,times,labels,nbhd_channels=nbhd_channels,clip_size=clip_size,chunk_infos=chunk_infos)
             #mdaio.writemda32(templates,'tmp-templates-{}.mda'.format(m_central+1))
 
-            if self._sorting_opts['verbose']:
-                print ('Re-assigning events for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
+            print ('Re-assigning events for channel {} ({})...'.format(m_central+1,mode)); sys.stdout.flush()
             tc_peaks, tc_peak_times=compute_template_channel_peaks(templates,detect_sign=detect_sign) # M_neigh x K
             peak_channels=np.argmax(tc_peaks,axis=0) # The channels on which the peaks occur
             
@@ -448,8 +434,7 @@ class _NeighborhoodSorter:
                     times2[inds_k]+=dt
                     channel_assignments2[inds_k]=nbhd_channels[assigned_channel_within_neighborhood]
                     if m_central!=nbhd_channels[assigned_channel_within_neighborhood]:
-                        if self._sorting_opts['verbose']:
-                            print ('Re-assigning {} events from {} to {} with dt={} (k={})'.format(len(inds_k),m_central+1,nbhd_channels[assigned_channel_within_neighborhood]+1,dt,k+1)); sys.stdout.flush()
+                        print ('Re-assigning {} events from {} to {} with dt={} (k={})'.format(len(inds_k),m_central+1,nbhd_channels[assigned_channel_within_neighborhood]+1,dt,k+1)); sys.stdout.flush()
             with h5py.File(self._hdf5_path,"a") as f:
                 f.create_dataset('phase1-times',data=times2)
                 f.create_dataset('phase1-channel-assignments',data=channel_assignments2)
@@ -523,11 +508,11 @@ class TimeseriesModel_Recording:
     def __init__(self,recording):
         self._recording=recording
     def numChannels(self):
-        return len(self._recording.get_channel_ids())
+        return len(self._recording.getChannelIds())
     def numTimepoints(self):
-        return self._recording.get_num_frames()
+        return self._recording.getNumFrames()
     def getChunk(self,*,t1,t2,channels):
-        channel_ids=self._recording.get_channel_ids()
+        channel_ids=self._recording.getChannelIds()
         channels2=np.zeros(len(channels))
         for i in range(len(channels)):
             channels2[i]=channel_ids[int(channels[i])]
@@ -538,13 +523,13 @@ class TimeseriesModel_Recording:
             ret[:,t1a-(t1):t2a-(t1)]=self.getChunk(t1=t1a,t2=t2a,channels=channels)
             return ret
         else:
-            return self._recording.get_traces(start_frame=t1,end_frame=t2,channel_ids=channels2)
+            return self._recording.getTraces(start_frame=t1,end_frame=t2,channel_ids=channels2)
     
 def prepare_timeseries_hdf5_from_recording(recording,timeseries_hdf5_fname,*,chunk_size,padding):
     chunk_size_with_padding=chunk_size+2*padding
     with h5py.File(timeseries_hdf5_fname,"w") as f:
-        M=len(recording.get_channel_ids()) # Number of channels
-        N=recording.get_num_frames() # Number of timepoints
+        M=len(recording.getChannelIds()) # Number of channels
+        N=recording.getNumFrames() # Number of timepoints
         num_chunks=int(np.ceil(N/chunk_size))
         f.create_dataset('chunk_size',data=[chunk_size])
         f.create_dataset('num_chunks',data=[num_chunks])
@@ -561,7 +546,7 @@ def prepare_timeseries_hdf5_from_recording(recording,timeseries_hdf5_fname,*,chu
             # determine aa so that t1-s1+aa = padding
             # so, aa = padding-(t1-s1)
             aa = padding-(t1-s1)
-            padded_chunk[:,aa:aa+s2-s1]=recording.get_traces(start_frame=s1,end_frame=s2) # Read the padded chunk
+            padded_chunk[:,aa:aa+s2-s1]=recording.getTraces(start_frame=s1,end_frame=s2) # Read the padded chunk
 
             for m in range(M):
                 f.create_dataset('part-{}-{}'.format(m,j),data=padded_chunk[m,:].ravel())
@@ -608,6 +593,7 @@ class MountainSort4:
             "detect_threshold":3,
             "num_features":10,
             "max_num_clips_for_pca":1000,
+            "isocut_threshold":1
         }
         self._timeseries_path=None
         self._firings_out_path=None
@@ -616,7 +602,7 @@ class MountainSort4:
         self._num_workers=0
         self._recording=None
     def setSortingOpts(self,clip_size=None,adjacency_radius=None,detect_sign=None,detect_interval=None,
-                       detect_threshold=None,num_features=None,max_num_clips_for_pca=None, verbose=True):
+                       detect_threshold=None,num_features=None,max_num_clips_for_pca=None,isocut_threshold=None):
         if clip_size is not None:
             self._sorting_opts['clip_size']=clip_size
         if adjacency_radius is not None:
@@ -631,8 +617,8 @@ class MountainSort4:
             self._sorting_opts['num_features']=num_features
         if max_num_clips_for_pca is not None:
             self._sorting_opts['max_num_clips_for_pca']=max_num_clips_for_pca
-        if verbose is not None:
-            self._sorting_opts['verbose']=verbose
+        if isocut_threshold is not None: # added by sk 20'/12/2
+            self._sorting_opts['isocut_threshold']=isocut_threshold
     def setRecording(self,recording):
         self._recording=recording
     def setTimeseriesPath(self,path):
@@ -648,28 +634,23 @@ class MountainSort4:
     def eventTimesLabelsChannels(self):
         return (self._event_times, self._event_labels, self._event_labels)
     def sort(self):
-
         if not self._temporary_directory:
             raise Exception('Temporary directory not set.')
 
         num_workers=self._num_workers
         if num_workers<=0:
             num_workers=int((multiprocessing.cpu_count()+1)/2)
-        if self._sorting_opts['verbose']:
-            print('Num. workers = {}'.format(num_workers))
 
-        dask.config.set(scheduler='processes')  # overwrite default with multiprocessing scheduler
+        print('Num. workers = {}'.format(num_workers))
 
         clip_size=self._sorting_opts['clip_size']
 
         temp_hdf5_path=self._temporary_directory+'/timeseries.hdf5'
-
         if os.path.exists(temp_hdf5_path):
             os.remove(temp_hdf5_path)
         hdf5_chunk_size=1000000
         hdf5_padding=clip_size*10
-        if self._sorting_opts['verbose']:
-            print ('Preparing {}...'.format(temp_hdf5_path))
+        print ('Preparing {}...'.format(temp_hdf5_path))
         if self._timeseries_path:
             prepare_timeseries_hdf5(self._timeseries_path,temp_hdf5_path,chunk_size=hdf5_chunk_size,padding=hdf5_padding)
             X=TimeseriesModel_Hdf5(temp_hdf5_path)
@@ -683,11 +664,8 @@ class MountainSort4:
         M=X.numChannels()
         N=X.numTimepoints()
 
-        if self._sorting_opts['verbose']:
-            print('Preparing neighborhood sorters (M={}, N={})...'.format(M,N)); sys.stdout.flush()
+        print ('Preparing neighborhood sorters (M={}, N={})...'.format(M,N)); sys.stdout.flush()
         neighborhood_sorters=[]
-        dask_list = []
-        
         for m in range(M):
             NS=_NeighborhoodSorter()
             NS.setSortingOpts(self._sorting_opts)
@@ -699,15 +677,15 @@ class MountainSort4:
                 os.remove(fname0)
             NS.setHdf5FilePath(fname0)
             neighborhood_sorters.append(NS)
-            tmp_dask = dask.delayed(run_phase1_sort)(NS)
-            dask_list.append(tmp_dask)
 
-        dask.compute(*dask_list, num_workers=self._num_workers)
-
+        pool = multiprocessing.Pool(num_workers)
+        pool.map(run_phase1_sort, neighborhood_sorters)
+        pool.close()
+        pool.join()
         #for m in range(M):
         #    print ('Running phase1 neighborhood sort for channel {} of {}...'.format(m+1,M)); sys.stdout.flush()
         #    neighborhood_sorters[m].runPhase1Sort()
-        dask_list = []
+
         for m in range(M):
             times_m=neighborhood_sorters[m].getPhase1Times()
             channel_assignments_m=neighborhood_sorters[m].getPhase1ChannelAssignments()
@@ -715,17 +693,16 @@ class MountainSort4:
                 inds_m_m2=np.where(channel_assignments_m==m2)[0]
                 if len(inds_m_m2)>0:
                     neighborhood_sorters[m2].addAssignedEventTimes(times_m[inds_m_m2])
-        for neighborhood_sorter in neighborhood_sorters:
-            tmp_dask = dask.delayed(run_phase2_sort)(neighborhood_sorter)
-            dask_list.append(tmp_dask)
-        dask.compute(*dask_list, num_workers=self._num_workers)
 
+        pool = multiprocessing.Pool(num_workers)
+        pool.map(run_phase2_sort, neighborhood_sorters) 
+        pool.close()
+        pool.join()
         #for m in range(M):
         #    print ('Running phase2 sort for channel {} of {}...'.format(m+1,M)); sys.stdout.flush()
         #    neighborhood_sorters[m].runPhase2Sort()
 
-        if self._sorting_opts['verbose']:
-            print ('Preparing output...'); sys.stdout.flush()
+        print ('Preparing output...'); sys.stdout.flush()
         all_times_list=[]
         all_labels_list=[]
         all_channels_list=[]
@@ -751,9 +728,8 @@ class MountainSort4:
         self._event_channels=all_channels
 
         if self._firings_out_path is not None:
-            if self._sorting_opts['verbose']:
-                print ('Writing firings file...'); sys.stdout.flush()
+            print ('Writing firings file...'); sys.stdout.flush()
             write_firings_file(all_channels,all_times,all_labels,self._firings_out_path)
-        if self._sorting_opts['verbose']:
-            print ('Done with ms4alg.'); sys.stdout.flush()
+
+        print ('Done with ms4alg.'); sys.stdout.flush()
 
