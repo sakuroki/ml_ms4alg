@@ -12,7 +12,7 @@ def sort(*,
          firings_out,
          adjacency_radius,detect_sign,
          detect_interval=10,detect_threshold=3,clip_size=50,
-         num_features=10, max_num_clips_for_pca=1000,
+         num_features=10, max_num_clips_for_pca=1000,isocut_threshold=1,
          num_workers=multiprocessing.cpu_count()):
     """
     MountainSort spike sorting (version 4)
@@ -43,6 +43,8 @@ def sort(*,
         The max number of clips that will be subsampled for PCA.
     num_workers : int
         Number of simultaneous workers (or processes). The default is multiprocessing.cpu_count().
+    isocut_threshold : float
+        Threshold of isocut in isosplit5.
     """
     
     tempdir=os.environ.get('ML_PROCESSOR_TEMPDIR')
@@ -71,7 +73,7 @@ def sort(*,
     MS4.setGeom(Geom)
     MS4.setSortingOpts(clip_size=clip_size,adjacency_radius=adjacency_radius,detect_sign=detect_sign,
                        detect_interval=detect_interval,detect_threshold=detect_threshold,
-                       num_features=num_features,max_num_clips_for_pca=max_num_clips_for_pca)
+                       num_features=num_features,max_num_clips_for_pca=max_num_clips_for_pca,isocut_threshold=isocut_threshold)
     MS4.setNumWorkers(num_workers)
     MS4.setTimeseriesPath(timeseries)
     MS4.setFiringsOutPath(firings_out)
